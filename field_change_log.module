@@ -60,7 +60,7 @@ function field_change_log_theme() {
         'changed' => 0,
         'uid' => 0,
         'text_before' => '',
-        'date_format' => 'medium',
+        'date_format' => 'date_only',
         'show_author' => FALSE,
       ],
     ],
@@ -638,7 +638,7 @@ function field_change_log_block_view($delta = '', $settings = [], $contexts = []
       '#changed' => $latest->changed,
       '#uid' => $latest->uid,
       '#text_before' => $settings['prefix'] ?? '',
-      '#date_format' => $settings['date_format'] ?? 'medium',
+      '#date_format' => $settings['date_format'] ?? 'date_only',
       '#show_author' => !empty($settings['show_author']),
     ],
   ];

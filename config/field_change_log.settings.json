@@ -1,6 +1,6 @@
 {
     "_config_name": "field_change_log.settings",
     "tracked": {},
-    "date_format": "medium",
+    "date_format": "date_only",
     "prefix": "Last updated:"
 }
