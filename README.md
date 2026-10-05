@@ -38,7 +38,9 @@ Tracking starts when you turn it on. For content that changed earlier, go to
 past changes**:
 
 - If the content has **revisions**, each revision in which the field changed
-  is recorded, with that revision's date and author.
+  is recorded, with that revision's date and author. Edits saved without a
+  new revision keep the older revision's date, so for the most reliable
+  history, create new revisions by default.
 - If it has no revision history, you can choose to use the content's
   "updated" date instead. That date is approximate: it may be later than the
   field's real last change.
@@ -54,6 +56,21 @@ fields with how many changes have been recorded and the latest one.
 
 ## Notes
 
+- **What counts as a change:** the field's stored values. For text fields,
+  differences in spacing or line breaks alone are ignored, because editors
+  such as CKEditor reformat HTML when content is saved. Changed words or
+  markup always count.
+- **Access:** the date is only shown to people who can see the field itself.
+  Views can't check field access per row, so only add a "last changed" date to
+  Views that list fields people are allowed to see.
+- **Turning tracking off and on again:** changes made while a field is not
+  tracked are not recorded, so the date shown afterwards may be older than
+  the real last change.
+- **Display modes:** the "last changed" item starts hidden in the view modes
+  that exist when tracking is turned on. A view mode given its own settings
+  later shows it until you hide it there.
+- **Listings:** each displayed item with a visible "last changed" makes one
+  small database query.
 - Each language of a translated field is tracked separately. In Views, a
   field tracked in several languages can produce one row per language.
 - Deleting content deletes its recorded changes. Deleting a field deletes the

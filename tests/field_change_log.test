@@ -18,7 +18,7 @@ class FieldChangeLogTestCase extends BackdropWebTestCase {
    * {@inheritdoc}
    */
   protected function setUp() {
-    parent::setUp('field_change_log');
+    parent::setUp(['field_change_log', 'field_change_log_test']);
     field_create_field([
       'field_name' => 'field_note',
       'type' => 'text_long',
@@ -129,6 +129,206 @@ class FieldChangeLogTestCase extends BackdropWebTestCase {
     $this->backdropGet('node/' . $node->nid);
     $this->assertRaw('class="field-change-log"', 'The extra field shows when made visible.');
     $this->assertText(config_get('field_change_log.settings', 'prefix'), 'The text before the date is shown.');
+  }
+
+  /**
+   * The extra field and the block respect field access.
+   */
+  public function testAccess() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'A note']]],
+    ]);
+    $bundle_settings = field_bundle_settings('node', 'page');
+    $bundle_settings['extra_fields']['display']['field_change_log_field_note']['default'] = ['weight' => 10, 'visible' => TRUE];
+    field_bundle_settings('node', 'page', $bundle_settings);
+    $block_settings = ['field_name' => 'field_note', 'prefix' => 'Updated:', 'date_format' => 'date_only'];
+
+    $this->backdropGet('node/' . $node->nid);
+    $this->assertRaw('class="field-change-log"', 'Shown when the field can be seen.');
+    $block = module_invoke('field_change_log', 'block_view', 'last_changed', $block_settings, ['node' => $node]);
+    $this->assertTrue(!empty($block['content']), 'The block has content when the field can be seen.');
+
+    state_set('field_change_log_test_deny', TRUE);
+    cache_clear_all();
+    $this->backdropGet('node/' . $node->nid);
+    $this->assertNoRaw('class="field-change-log"', 'Hidden when the field cannot be seen.');
+    $block = module_invoke('field_change_log', 'block_view', 'last_changed', $block_settings, ['node' => $node]);
+    $this->assertTrue(empty($block), 'The block is empty when the field cannot be seen.');
+    state_set('field_change_log_test_deny', FALSE);
+  }
+
+  /**
+   * The block shows the date of the last change, and nothing for untracked
+   * fields or content without a recorded change.
+   */
+  public function testBlock() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'A note']]],
+    ]);
+    $latest = field_change_log_get_latest('node', $node->nid, 'field_note');
+    $settings = ['field_name' => 'field_note', 'prefix' => 'Updated:', 'date_format' => 'date_only'];
+    $block = module_invoke('field_change_log', 'block_view', 'last_changed', $settings, ['node' => $node]);
+    $html = backdrop_render($block['content']);
+    $this->assertTrue(strpos($html, 'Updated:') !== FALSE, 'The block shows the text before the date.');
+    $this->assertTrue(strpos($html, format_date($latest->changed, 'date_only')) !== FALSE, 'The block shows the date of the last change.');
+
+    $empty = $this->backdropCreateNode(['type' => 'page']);
+    $block = module_invoke('field_change_log', 'block_view', 'last_changed', $settings, ['node' => $empty]);
+    $this->assertTrue(empty($block), 'Nothing is shown for content without a recorded change.');
+
+    field_change_log_set_tracked('node', 'page', 'field_note', FALSE);
+    $block = module_invoke('field_change_log', 'block_view', 'last_changed', $settings, ['node' => $node]);
+    $this->assertTrue(empty($block), 'Nothing is shown for an untracked field.');
+  }
+
+  /**
+   * Past changes are filled in from revision history.
+   */
+  public function testRebuild() {
+    module_load_include('inc', 'field_change_log', 'field_change_log.admin');
+    // Build history while the field is untracked.
+    field_change_log_set_tracked('node', 'page', 'field_note', FALSE);
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'first']]],
+    ]);
+    $first_vid = $node->vid;
+    db_update('node_revision')->fields(['timestamp' => 1000000000])->condition('vid', $first_vid)->execute();
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->revision = TRUE;
+    $node->field_note[LANGUAGE_NONE][0]['value'] = 'second';
+    $node->save();
+    $second_vid = $node->vid;
+    db_update('node_revision')->fields(['timestamp' => 1100000000])->condition('vid', $second_vid)->execute();
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->revision = TRUE;
+    $node->title = 'Only the title changed';
+    $node->save();
+    field_change_log_set_tracked('node', 'page', 'field_note', TRUE);
+
+    $result = field_change_log_rebuild_node_field($node->nid, 'page', 'field_note', FALSE);
+    $this->assertEqual($result, 'history', 'Changes were found in the revision history.');
+    $rows = db_query('SELECT revision_id, changed FROM {field_change_log} WHERE entity_id = :id ORDER BY changed', [':id' => $node->nid])->fetchAll();
+    $this->assertEqual(count($rows), 2, 'Two changes found: creation and the edit; the title-only revision is ignored.');
+    $this->assertEqual($rows[0]->revision_id, $first_vid, 'The first change is the first revision.');
+    $this->assertEqual($rows[1]->revision_id, $second_vid, 'The second change is the second revision.');
+    $this->assertEqual(field_change_log_get_latest('node', $node->nid, 'field_note')->changed, 1100000000, 'The latest change has the second revision\'s date.');
+    $this->assertNull(field_change_log_rebuild_node_field($node->nid, 'page', 'field_note', FALSE), 'Content with recorded changes is skipped.');
+
+    // A single revision: no history, unless the "updated" date is allowed.
+    field_change_log_set_tracked('node', 'page', 'field_note', FALSE);
+    $single = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'only']]],
+    ]);
+    field_change_log_set_tracked('node', 'page', 'field_note', TRUE);
+    $this->assertNull(field_change_log_rebuild_node_field($single->nid, 'page', 'field_note', FALSE), 'A single revision gives no history.');
+    $this->assertEqual(field_change_log_rebuild_node_field($single->nid, 'page', 'field_note', TRUE), 'approximate', 'The updated date is used when allowed.');
+  }
+
+  /**
+   * Views gets a sortable "last changed" date for each tracked field.
+   */
+  public function testViews() {
+    $older = $this->backdropCreateNode(['type' => 'page', 'field_note' => [LANGUAGE_NONE => [['value' => 'old']]]]);
+    $newer = $this->backdropCreateNode(['type' => 'page', 'field_note' => [LANGUAGE_NONE => [['value' => 'new']]]]);
+    db_update('field_change_log_latest')->fields(['changed' => 1000000000])->condition('entity_id', $older->nid)->execute();
+    $untouched = $this->backdropCreateNode(['type' => 'page']);
+
+    // This test process cached Views' module list and hook implementations
+    // before this module's views include was loaded; start them afresh.
+    module_implements_reset();
+    backdrop_static_reset();
+    views_invalidate_cache();
+    $table = 'field_change_log__node__field_note';
+    $this->assertTrue((bool) views_fetch_data($table), 'Views has data for the tracked field.');
+    $view = views_new_view();
+    $view->base_table = 'node';
+    $handler = $view->new_display('default', 'Default', 'default');
+    $handler->display->display_options['fields']['nid'] = ['id' => 'nid', 'table' => 'node', 'field' => 'nid'];
+    $handler->display->display_options['fields']['changed'] = ['id' => 'changed', 'table' => $table, 'field' => 'changed'];
+    $handler->display->display_options['sorts']['changed'] = ['id' => 'changed', 'table' => $table, 'field' => 'changed', 'order' => 'DESC'];
+    $handler->display->display_options['filters']['type'] = ['id' => 'type', 'table' => 'node', 'field' => 'type', 'value' => ['page' => 'page']];
+    $view->set_display('default');
+    $view->pre_execute();
+    $view->execute();
+
+    $nids = [];
+    foreach ($view->result as $row) {
+      $nids[] = $row->nid;
+    }
+    $this->assertEqual(count($nids), count(array_unique($nids)), 'Each piece of content appears once.');
+    $ours = array_values(array_intersect($nids, [$newer->nid, $older->nid, $untouched->nid]));
+    $this->assertEqual($ours, [$newer->nid, $older->nid, $untouched->nid], 'Sorted by last change, newest first; content without a change comes last. Got ' . json_encode($ours) . ' expected ' . json_encode([$newer->nid, $older->nid, $untouched->nid]) . ' query: ' . (string) $view->build_info['query']);
+  }
+
+  /**
+   * Renaming a bundle keeps tracking; deleting a revision keeps the change.
+   */
+  public function testBundleRenameAndRevisionDelete() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'first']]],
+    ]);
+    $first_vid = $node->vid;
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->revision = TRUE;
+    $node->field_note[LANGUAGE_NONE][0]['value'] = 'second';
+    $node->save();
+
+    node_revision_delete($first_vid);
+    $revision = db_query('SELECT revision_id FROM {field_change_log} WHERE entity_id = :id ORDER BY id LIMIT 1', [':id' => $node->nid])->fetchField();
+    $this->assertNull($revision, 'A deleted revision is no longer referenced.');
+    $this->assertEqual(db_query('SELECT COUNT(*) FROM {field_change_log} WHERE entity_id = :id', [':id' => $node->nid])->fetchField(), 2, 'Both changes are kept.');
+
+    field_attach_rename_bundle('node', 'page', 'basic_page');
+    $this->assertTrue(field_change_log_is_tracked('node', 'basic_page', 'field_note'), 'Tracking moves to the renamed bundle.');
+    $this->assertFalse(field_change_log_is_tracked('node', 'page', 'field_note'), 'The old bundle name is gone.');
+    $bundle = db_query('SELECT DISTINCT bundle FROM {field_change_log} WHERE entity_id = :id', [':id' => $node->nid])->fetchField();
+    $this->assertEqual($bundle, 'basic_page', 'Recorded changes move to the renamed bundle.');
+  }
+
+  /**
+   * Array-valued columns (such as a link's attributes) are compared.
+   */
+  public function testArrayColumns() {
+    $field = [
+      'module' => 'field_change_log_test_none',
+      'columns' => ['url' => [], 'attributes' => []],
+    ];
+    $a = field_change_log_normalize_values($field, [LANGUAGE_NONE => [['url' => 'https://example.com', 'attributes' => ['target' => '_blank']]]]);
+    $b = field_change_log_normalize_values($field, [LANGUAGE_NONE => [['url' => 'https://example.com', 'attributes' => []]]]);
+    $this->assertNotEqual($a, $b, 'A change in an array column counts as a change.');
+  }
+
+  /**
+   * Reformatting by an editor (spacing only) is not a change; words are.
+   */
+  public function testTextWhitespace() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => "<p>\r\n    Same words here.\r\n</p>"]]],
+    ]);
+    $count = $this->countChanges($node->nid);
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->field_note[LANGUAGE_NONE][0]['value'] = '<p>Same words here.</p>';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), $count, 'Reformatted HTML with the same words is not a change.');
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->field_note[LANGUAGE_NONE][0]['value'] = '<p>Different words here.</p>';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), $count + 1, 'Changed words are a change.');
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->field_note[LANGUAGE_NONE][0]['value'] = '<p><strong>Different</strong> words here.</p>';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), $count + 2, 'Changed markup is a change.');
   }
 
 }

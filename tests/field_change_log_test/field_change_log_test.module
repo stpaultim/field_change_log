@@ -1,0 +1,17 @@
+<?php
+/**
+ * @file
+ * Support module for Field Change Log tests.
+ */
+
+/**
+ * Implements hook_field_access().
+ *
+ * Denies viewing field_note while the test asks for it.
+ */
+function field_change_log_test_field_access($op, $field, $entity_type, $entity, $account) {
+  if ($op == 'view' && $field['field_name'] == 'field_note' && state_get('field_change_log_test_deny', FALSE)) {
+    return FALSE;
+  }
+  return TRUE;
+}

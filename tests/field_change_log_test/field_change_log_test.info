@@ -1,0 +1,7 @@
+name = Field Change Log test helper
+description = Support module for Field Change Log tests.
+package = Testing
+backdrop = 1.x
+type = module
+hidden = TRUE
+dependencies[] = field_change_log

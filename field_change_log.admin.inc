@@ -61,7 +61,7 @@ function field_change_log_rebuild_form($form, &$form_state) {
   $form['rebuild'] = [
     '#type' => 'fieldset',
     '#title' => t('Fill in past changes from revision history'),
-    '#description' => t('For content that has no recorded change yet, looks through its revisions and records each revision in which a tracked field changed. Content with recorded changes is left alone, so this is safe to run again. Only content (nodes) keeps revisions.'),
+    '#description' => t('For content that has no recorded change yet, looks through its revisions and records each revision in which a tracked field changed. Content with recorded changes is left alone, so this is safe to run again. Only content (nodes) keeps revisions, and only content saved with new revisions has a reliable history: edits saved without a new revision keep the older revision\'s date.'),
   ];
   $form['rebuild']['use_updated_date'] = [
     '#type' => 'checkbox',
@@ -134,8 +134,11 @@ function field_change_log_rebuild_node_field($nid, $bundle, $field_name, $use_up
   $field = field_info_field($field_name);
   $revisions = db_query('SELECT vid, timestamp, uid FROM {node_revision} WHERE nid = :nid ORDER BY vid', [':nid' => $nid])->fetchAllAssoc('vid');
 
-  // A single revision's timestamp moves on every save, so it says nothing
-  // about when this field changed. History needs at least two revisions.
+  // A revision's timestamp is set only when that revision is created; saving
+  // without a new revision updates its values in place but keeps the old
+  // timestamp. So a single revision says nothing about when this field
+  // changed, and changes found in the newest revision may really be later
+  // than its date. History needs at least two revisions.
   if (count($revisions) > 1 && $field['storage']['type'] == 'field_sql_storage') {
     $values = field_change_log_revision_values($field, $nid);
     $previous = [];

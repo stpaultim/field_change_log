@@ -195,7 +195,7 @@ function field_change_log_form_field_ui_field_edit_form_alter(&$form, &$form_sta
   $form['instance']['field_change_log'] = [
     '#type' => 'checkbox',
     '#title' => t('Track when this field changes'),
-    '#description' => t('Record the date and person each time this field\'s value changes. The date can then be shown on the page, in a block, or in Views.'),
+    '#description' => t('Record the date and person each time this field\'s value changes. The date can then be shown on the page, in a block, or in Views. For text fields, changes to spacing or line breaks alone are ignored. Changes made while tracking is off are not recorded.'),
     '#default_value' => field_change_log_is_tracked($instance['entity_type'], $instance['bundle'], $instance['field_name']),
     '#weight' => 50,
   ];
@@ -304,6 +304,58 @@ function field_change_log_field_attach_delete($entity_type, $entity) {
 }
 
 /**
+ * Implements hook_field_attach_delete_revision().
+ *
+ * Keeps the change, but forgets the revision it pointed at.
+ */
+function field_change_log_field_attach_delete_revision($entity_type, $entity) {
+  list($id, $revision_id) = entity_extract_ids($entity_type, $entity);
+  if (!$revision_id) {
+    return;
+  }
+  foreach (['field_change_log', 'field_change_log_latest'] as $table) {
+    db_update($table)
+      ->fields(['revision_id' => NULL])
+      ->condition('entity_type', $entity_type)
+      ->condition('entity_id', $id)
+      ->condition('revision_id', $revision_id)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_field_attach_rename_bundle().
+ *
+ * Without this, renaming a content type (or other bundle) would silently stop
+ * tracking its fields.
+ */
+function field_change_log_field_attach_rename_bundle($entity_type, $bundle_old, $bundle_new) {
+  $config = config('field_change_log.settings');
+  $tracked = $config->get('tracked') ?: [];
+  if (isset($tracked[$entity_type][$bundle_old])) {
+    $tracked[$entity_type][$bundle_new] = $tracked[$entity_type][$bundle_old];
+    unset($tracked[$entity_type][$bundle_old]);
+    $config->set('tracked', $tracked);
+    $config->save();
+  }
+  foreach (['field_change_log', 'field_change_log_latest'] as $table) {
+    db_update($table)
+      ->fields(['bundle' => $bundle_new])
+      ->condition('entity_type', $entity_type)
+      ->condition('bundle', $bundle_old)
+      ->execute();
+  }
+}
+
+/**
+ * Whether the current person may see a field (and so, when it changed).
+ */
+function field_change_log_can_view_field($entity_type, $entity, $field_name) {
+  $field = field_info_field($field_name);
+  return $field && field_access('view', $field, $entity_type, $entity);
+}
+
+/**
  * Writes the changes detected in presave.
  */
 function field_change_log_write_pending($entity_type, $entity) {
@@ -391,6 +443,10 @@ function field_change_log_record($entity_type, $bundle, $entity_id, $field_name,
  */
 function field_change_log_normalize_values(array $field, array $values) {
   $columns = array_keys($field['columns']);
+  // Text fields: editors reformat HTML on save (CKEditor turns
+  // "<p>\r\n    Text\r\n</p>" into "<p>Text</p>"), so spacing alone must
+  // not count as a change.
+  $text_columns = ($field['module'] == 'text') ? ['value', 'summary'] : [];
   $normalized = [];
   foreach ($values as $langcode => $items) {
     if (!is_array($items)) {
@@ -403,7 +459,20 @@ function field_change_log_normalize_values(array $field, array $values) {
       }
       $row = [];
       foreach ($columns as $column) {
-        $row[$column] = isset($item[$column]) && !is_array($item[$column]) ? (string) $item[$column] : '';
+        if (!isset($item[$column])) {
+          $row[$column] = '';
+        }
+        elseif (is_array($item[$column])) {
+          // Array columns (e.g. a link's attributes) are stored serialized;
+          // compare them by content.
+          $row[$column] = json_encode($item[$column]);
+        }
+        else {
+          $row[$column] = (string) $item[$column];
+          if (in_array($column, $text_columns, TRUE)) {
+            $row[$column] = field_change_log_normalize_text($row[$column]);
+          }
+        }
       }
       $clean[] = $row;
     }
@@ -412,6 +481,24 @@ function field_change_log_normalize_values(array $field, array $values) {
     }
   }
   return $normalized;
+}
+
+/**
+ * Normalizes text for comparison, ignoring differences in spacing only.
+ *
+ * Line endings, runs of whitespace, and whitespace next to HTML tags or at
+ * the ends are ignored; any change to the words or the markup still counts.
+ *
+ * @param string $text
+ *   A text field value.
+ *
+ * @return string
+ *   The text with insignificant whitespace removed.
+ */
+function field_change_log_normalize_text($text) {
+  $text = preg_replace('/\s+/u', ' ', $text);
+  $text = preg_replace('/\s*(<[^>]*>)\s*/u', '$1', $text);
+  return trim($text);
 }
 
 /* --------------------------------------------------------------------------
@@ -534,7 +621,7 @@ function field_change_log_entity_view($entity, $type, $view_mode, $langcode) {
   $extra = field_extra_fields_get_display($type, $bundle, $view_mode);
   foreach ($fields as $field_name) {
     $key = 'field_change_log_' . $field_name;
-    if (empty($extra[$key]['visible'])) {
+    if (empty($extra[$key]['visible']) || !field_change_log_can_view_field($type, $entity, $field_name)) {
       continue;
     }
     if ($latest = field_change_log_get_latest($type, $id, $field_name, $langcode)) {
@@ -625,6 +712,9 @@ function field_change_log_block_view($delta = '', $settings = [], $contexts = []
   }
   $node = $contexts['node'];
   if (empty($node->nid) || !field_change_log_is_tracked('node', $node->type, $settings['field_name'])) {
+    return [];
+  }
+  if (!field_change_log_can_view_field('node', $node, $settings['field_name'])) {
     return [];
   }
   $latest = field_change_log_get_latest('node', $node->nid, $settings['field_name'], $node->langcode ?? NULL);
