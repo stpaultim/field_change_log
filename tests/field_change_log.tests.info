@@ -1,0 +1,5 @@
+[FieldChangeLogTestCase]
+name = Field Change Log
+description = Tests that changes to tracked fields are recorded, and nothing else is.
+group = Field Change Log
+file = field_change_log.test

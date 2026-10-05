@@ -1,0 +1,94 @@
+<?php
+/**
+ * @file
+ * Install, update and uninstall functions for Field Change Log.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function field_change_log_schema() {
+  $entity_columns = [
+    'entity_type' => [
+      'description' => 'The entity type, e.g. node.',
+      'type' => 'varchar',
+      'length' => 128,
+      'not null' => TRUE,
+      'default' => '',
+    ],
+    'bundle' => [
+      'description' => 'The entity bundle, e.g. the content type.',
+      'type' => 'varchar',
+      'length' => 128,
+      'not null' => TRUE,
+      'default' => '',
+    ],
+    'entity_id' => [
+      'description' => 'The entity ID.',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+    ],
+    'field_name' => [
+      'description' => 'The machine name of the field that changed.',
+      'type' => 'varchar',
+      'length' => 32,
+      'not null' => TRUE,
+      'default' => '',
+    ],
+    'langcode' => [
+      'description' => 'The language of the field values that changed.',
+      'type' => 'varchar',
+      'length' => 12,
+      'not null' => TRUE,
+      'default' => '',
+    ],
+    'revision_id' => [
+      'description' => 'The entity revision ID saved with the change, if any.',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => FALSE,
+    ],
+    'uid' => [
+      'description' => 'The person who made the change (0 if unknown).',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+    ],
+    'changed' => [
+      'description' => 'Unix timestamp of the change.',
+      'type' => 'int',
+      'not null' => TRUE,
+      'default' => 0,
+    ],
+  ];
+
+  $schema['field_change_log'] = [
+    'description' => 'One row per change to a tracked field.',
+    'fields' => ['id' => [
+      'description' => 'Primary key.',
+      'type' => 'serial',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+    ]] + $entity_columns,
+    'primary key' => ['id'],
+    'indexes' => [
+      'entity_field' => ['entity_type', 'entity_id', 'field_name', 'changed'],
+      'bundle_field' => ['entity_type', 'bundle', 'field_name'],
+      'changed' => ['changed'],
+    ],
+  ];
+
+  $schema['field_change_log_latest'] = [
+    'description' => 'The most recent change to each tracked field of each entity, for fast display, sorting and Views.',
+    'fields' => $entity_columns,
+    'primary key' => ['entity_type', 'entity_id', 'field_name', 'langcode'],
+    'indexes' => [
+      'bundle_field' => ['entity_type', 'bundle', 'field_name'],
+      'changed' => ['changed'],
+    ],
+  ];
+
+  return $schema;
+}

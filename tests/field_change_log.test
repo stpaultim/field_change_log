@@ -1,0 +1,134 @@
+<?php
+/**
+ * @file
+ * Tests for Field Change Log.
+ */
+
+/**
+ * Tests recording of field changes.
+ */
+class FieldChangeLogTestCase extends BackdropWebTestCase {
+
+  /**
+   * {@inheritdoc}
+   */
+  protected $profile = 'standard';
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function setUp() {
+    parent::setUp('field_change_log');
+    field_create_field([
+      'field_name' => 'field_note',
+      'type' => 'text_long',
+    ]);
+    field_create_instance([
+      'field_name' => 'field_note',
+      'entity_type' => 'node',
+      'bundle' => 'page',
+      'label' => 'Note',
+    ]);
+    field_change_log_set_tracked('node', 'page', 'field_note', TRUE);
+  }
+
+  /**
+   * Counts recorded changes for a node.
+   */
+  protected function countChanges($nid) {
+    return (int) db_query('SELECT COUNT(*) FROM {field_change_log} WHERE entity_type = :type AND entity_id = :id', [
+      ':type' => 'node',
+      ':id' => $nid,
+    ])->fetchField();
+  }
+
+  /**
+   * Changes to the tracked field are recorded; other saves are not.
+   */
+  public function testRecording() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'First note']]],
+    ]);
+    $this->assertEqual($this->countChanges($node->nid), 1, 'Creating content with a value records a change.');
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->title = 'A new title';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), 1, 'Changing another field records nothing.');
+
+    node_load($node->nid, NULL, TRUE)->save();
+    $this->assertEqual($this->countChanges($node->nid), 1, 'Re-saving unchanged content records nothing.');
+
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->field_note[LANGUAGE_NONE][0]['value'] = 'Second note';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), 2, 'Changing the tracked field records a change.');
+    $latest = field_change_log_get_latest('node', $node->nid, 'field_note');
+    $this->assertEqual($latest->revision_id, $node->vid, 'The latest change points at the saved revision.');
+
+    // A field-only save, as modules do to avoid touching the content itself.
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->original = clone $node;
+    $node->field_note[LANGUAGE_NONE] = [];
+    field_attach_presave('node', $node);
+    field_attach_update('node', $node);
+    $this->assertEqual($this->countChanges($node->nid), 3, 'A field-only save that empties the field records a change.');
+
+    field_change_log_set_tracked('node', 'page', 'field_note', FALSE);
+    $node = node_load($node->nid, NULL, TRUE);
+    $node->field_note[LANGUAGE_NONE][0]['value'] = 'Untracked now';
+    $node->save();
+    $this->assertEqual($this->countChanges($node->nid), 3, 'Nothing is recorded once tracking is turned off.');
+
+    node_delete($node->nid);
+    $this->assertEqual($this->countChanges($node->nid), 0, 'Deleting content removes its recorded changes.');
+    $latest = db_query('SELECT COUNT(*) FROM {field_change_log_latest} WHERE entity_id = :id', [':id' => $node->nid])->fetchField();
+    $this->assertEqual($latest, 0, 'Deleting content removes its latest-change rows.');
+  }
+
+  /**
+   * The field settings form turns tracking on and off.
+   */
+  public function testFieldSettingsForm() {
+    $admin = $this->backdropCreateUser(['administer content types', 'administer fields', 'bypass node access']);
+    $this->backdropLogin($admin);
+    field_change_log_set_tracked('node', 'page', 'field_note', FALSE);
+
+    $path = 'admin/structure/types/manage/page/fields/field_note';
+    $this->backdropGet($path);
+    $this->assertFieldByName('instance[field_change_log]', NULL, 'The tracking checkbox is on the field settings form.');
+    $this->backdropPost($path, ['instance[field_change_log]' => TRUE], t('Save settings'));
+    $this->assertTrue(field_change_log_is_tracked('node', 'page', 'field_note'), 'Checking the box tracks the field.');
+
+    $this->backdropPost($path, ['instance[field_change_log]' => FALSE], t('Save settings'));
+    $this->assertFalse(field_change_log_is_tracked('node', 'page', 'field_note'), 'Unchecking the box stops tracking.');
+  }
+
+  /**
+   * The "last changed" text is shown through the display settings.
+   */
+  public function testDisplay() {
+    $node = $this->backdropCreateNode([
+      'type' => 'page',
+      'field_note' => [LANGUAGE_NONE => [['value' => 'A note']]],
+    ]);
+
+    $this->backdropGet('node/' . $node->nid);
+    $this->assertNoRaw('class="field-change-log"', 'The extra field is hidden by default.');
+
+    $bundle_settings = field_bundle_settings('node', 'page');
+    $bundle_settings['extra_fields']['display']['field_change_log_field_note']['default'] = [
+      'weight' => 10,
+      'visible' => TRUE,
+    ];
+    field_bundle_settings('node', 'page', $bundle_settings);
+    // The first visit was cached for anonymous visitors.
+    cache_clear_all();
+
+    $this->backdropGet('node/' . $node->nid);
+    $this->assertRaw('class="field-change-log"', 'The extra field shows when made visible.');
+    $this->assertText(config_get('field_change_log.settings', 'prefix'), 'The text before the date is shown.');
+  }
+
+}

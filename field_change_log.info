@@ -1,0 +1,7 @@
+name = Field Change Log
+description = Records when individual fields change, and shows it in blocks, displays and Views.
+package = Fields
+backdrop = 1.x
+type = module
+dependencies[] = field
+configure = admin/config/content/field-change-log

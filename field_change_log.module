@@ -1,0 +1,645 @@
+<?php
+/**
+ * @file
+ * Records when individual fields change.
+ *
+ * Site architects choose which fields to track (on each field's settings
+ * form). Whenever a tracked field's stored values change, a row is added to
+ * {field_change_log} and the newest change per entity and field is kept in
+ * {field_change_log_latest} for display, sorting and Views.
+ *
+ * Only the time and the person are recorded, not the old values; use entity
+ * revisions for that.
+ */
+
+/**
+ * Implements hook_config_info().
+ */
+function field_change_log_config_info() {
+  return [
+    'field_change_log.settings' => [
+      'label' => t('Field Change Log settings'),
+      'group' => t('Configuration'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_permission().
+ */
+function field_change_log_permission() {
+  return [
+    'administer field change log' => [
+      'title' => t('Administer Field Change Log'),
+      'description' => t('See tracked fields and rebuild change dates from revision history.'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_menu().
+ */
+function field_change_log_menu() {
+  $items['admin/config/content/field-change-log'] = [
+    'title' => 'Field Change Log',
+    'description' => 'See which fields are tracked, and rebuild change dates from revision history.',
+    'page callback' => 'field_change_log_admin_page',
+    'access arguments' => ['administer field change log'],
+    'file' => 'field_change_log.admin.inc',
+  ];
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function field_change_log_theme() {
+  return [
+    'field_change_log_last_changed' => [
+      'variables' => [
+        'changed' => 0,
+        'uid' => 0,
+        'text_before' => '',
+        'date_format' => 'medium',
+        'show_author' => FALSE,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function field_change_log_views_api() {
+  return [
+    'api' => 3.0,
+    'path' => backdrop_get_path('module', 'field_change_log') . '/views',
+  ];
+}
+
+/* --------------------------------------------------------------------------
+ * Which fields are tracked.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Returns the tracked fields.
+ *
+ * @param string|null $entity_type
+ *   Limit to one entity type.
+ * @param string|null $bundle
+ *   Limit to one bundle (requires $entity_type).
+ *
+ * @return array
+ *   Without arguments: [entity_type => [bundle => [field_name, ...]]].
+ *   With an entity type: [bundle => [field_name, ...]].
+ *   With an entity type and bundle: [field_name, ...].
+ */
+function field_change_log_tracked_fields($entity_type = NULL, $bundle = NULL) {
+  $tracked = config_get('field_change_log.settings', 'tracked') ?: [];
+  if ($entity_type === NULL) {
+    return $tracked;
+  }
+  if ($bundle === NULL) {
+    return $tracked[$entity_type] ?? [];
+  }
+  return $tracked[$entity_type][$bundle] ?? [];
+}
+
+/**
+ * Whether a field instance is tracked.
+ */
+function field_change_log_is_tracked($entity_type, $bundle, $field_name) {
+  return in_array($field_name, field_change_log_tracked_fields($entity_type, $bundle));
+}
+
+/**
+ * Start or stop tracking a field instance.
+ */
+function field_change_log_set_tracked($entity_type, $bundle, $field_name, $track) {
+  $config = config('field_change_log.settings');
+  $tracked = $config->get('tracked') ?: [];
+  $fields = $tracked[$entity_type][$bundle] ?? [];
+
+  if ($track && !in_array($field_name, $fields)) {
+    $fields[] = $field_name;
+  }
+  elseif (!$track) {
+    $fields = array_values(array_diff($fields, [$field_name]));
+  }
+  else {
+    return;
+  }
+
+  if ($fields) {
+    sort($fields);
+    $tracked[$entity_type][$bundle] = $fields;
+  }
+  else {
+    unset($tracked[$entity_type][$bundle]);
+    if (empty($tracked[$entity_type])) {
+      unset($tracked[$entity_type]);
+    }
+  }
+  $config->set('tracked', $tracked);
+  $config->save();
+
+  if ($track) {
+    field_change_log_hide_extra_field($entity_type, $bundle, $field_name);
+  }
+
+  // Extra fields and Views data depend on which fields are tracked.
+  field_info_cache_clear();
+  if (module_exists('views')) {
+    views_invalidate_cache();
+  }
+}
+
+/**
+ * Starts a field's "last changed" display item hidden.
+ *
+ * Core shows extra fields in every view mode unless a display setting says
+ * otherwise (it ignores 'visible' => FALSE in hook_field_extra_fields()), so
+ * save "hidden" explicitly. Settings a site architect already chose are kept.
+ */
+function field_change_log_hide_extra_field($entity_type, $bundle, $field_name) {
+  $key = 'field_change_log_' . $field_name;
+  $settings = field_bundle_settings($entity_type, $bundle);
+  $view_modes = ['default'];
+  foreach ($settings['view_modes'] ?? [] as $view_mode => $view_mode_settings) {
+    if (!empty($view_mode_settings['custom_settings'])) {
+      $view_modes[] = $view_mode;
+    }
+  }
+  $changed = FALSE;
+  foreach ($view_modes as $view_mode) {
+    if (!isset($settings['extra_fields']['display'][$key][$view_mode])) {
+      $settings['extra_fields']['display'][$key][$view_mode] = [
+        'weight' => 100,
+        'visible' => FALSE,
+      ];
+      $changed = TRUE;
+    }
+  }
+  if ($changed) {
+    field_bundle_settings($entity_type, $bundle, $settings);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for field_ui_field_edit_form.
+ *
+ * Adds "Track when this field changes" to every field's settings form.
+ */
+function field_change_log_form_field_ui_field_edit_form_alter(&$form, &$form_state) {
+  $instance = $form['#instance'];
+  $form['instance']['field_change_log'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Track when this field changes'),
+    '#description' => t('Record the date and person each time this field\'s value changes. The date can then be shown on the page, in a block, or in Views.'),
+    '#default_value' => field_change_log_is_tracked($instance['entity_type'], $instance['bundle'], $instance['field_name']),
+    '#weight' => 50,
+  ];
+  $form['#submit'][] = 'field_change_log_field_edit_form_submit';
+}
+
+/**
+ * Submit handler: save the "Track when this field changes" setting.
+ */
+function field_change_log_field_edit_form_submit($form, &$form_state) {
+  $instance = $form['#instance'];
+  $track = !empty($form_state['values']['instance']['field_change_log']);
+  field_change_log_set_tracked($instance['entity_type'], $instance['bundle'], $instance['field_name'], $track);
+}
+
+/**
+ * Implements hook_field_delete_instance().
+ */
+function field_change_log_field_delete_instance($instance) {
+  field_change_log_set_tracked($instance['entity_type'], $instance['bundle'], $instance['field_name'], FALSE);
+  foreach (['field_change_log', 'field_change_log_latest'] as $table) {
+    db_delete($table)
+      ->condition('entity_type', $instance['entity_type'])
+      ->condition('bundle', $instance['bundle'])
+      ->condition('field_name', $instance['field_name'])
+      ->execute();
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Detecting and recording changes.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Implements hook_field_attach_presave().
+ *
+ * Runs for full entity saves and for field-only saves (field_attach_update()),
+ * so changes made by modules that skip the full save are caught too. Changes
+ * are only detected here; they are written once the entity has an ID, in
+ * hook_field_attach_insert() / hook_field_attach_update().
+ */
+function field_change_log_field_attach_presave($entity_type, $entity) {
+  list($id, , $bundle) = entity_extract_ids($entity_type, $entity);
+  $fields = field_change_log_tracked_fields($entity_type, $bundle);
+  if (!$fields) {
+    return;
+  }
+
+  $original = NULL;
+  if (!empty($id) && empty($entity->is_new)) {
+    $original = isset($entity->original) ? $entity->original : entity_load_unchanged($entity_type, $id);
+  }
+
+  $changes = [];
+  foreach ($fields as $field_name) {
+    // A field missing from the entity object is left unchanged by the save.
+    if (!property_exists($entity, $field_name)) {
+      continue;
+    }
+    $field = field_info_field($field_name);
+    if (!$field) {
+      continue;
+    }
+    $new = field_change_log_normalize_values($field, (array) $entity->{$field_name});
+    $old = ($original && isset($original->{$field_name}))
+      ? field_change_log_normalize_values($field, (array) $original->{$field_name})
+      : [];
+
+    foreach (array_unique(array_merge(array_keys($new), array_keys($old))) as $langcode) {
+      if (($new[$langcode] ?? []) !== ($old[$langcode] ?? [])) {
+        $changes[] = [$field_name, $langcode];
+      }
+    }
+  }
+
+  if ($changes) {
+    $entity->field_change_log_pending = $changes;
+  }
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ */
+function field_change_log_field_attach_insert($entity_type, $entity) {
+  field_change_log_write_pending($entity_type, $entity);
+}
+
+/**
+ * Implements hook_field_attach_update().
+ */
+function field_change_log_field_attach_update($entity_type, $entity) {
+  field_change_log_write_pending($entity_type, $entity);
+}
+
+/**
+ * Implements hook_field_attach_delete().
+ */
+function field_change_log_field_attach_delete($entity_type, $entity) {
+  list($id) = entity_extract_ids($entity_type, $entity);
+  foreach (['field_change_log', 'field_change_log_latest'] as $table) {
+    db_delete($table)
+      ->condition('entity_type', $entity_type)
+      ->condition('entity_id', $id)
+      ->execute();
+  }
+}
+
+/**
+ * Writes the changes detected in presave.
+ */
+function field_change_log_write_pending($entity_type, $entity) {
+  if (empty($entity->field_change_log_pending)) {
+    return;
+  }
+  global $user;
+  list($id, $revision_id, $bundle) = entity_extract_ids($entity_type, $entity);
+  foreach ($entity->field_change_log_pending as $change) {
+    list($field_name, $langcode) = $change;
+    field_change_log_record($entity_type, $bundle, $id, $field_name, $langcode, REQUEST_TIME, (int) $user->uid, $revision_id);
+  }
+  unset($entity->field_change_log_pending);
+}
+
+/**
+ * Records one change to a field.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $bundle
+ *   The bundle.
+ * @param int $entity_id
+ *   The entity ID.
+ * @param string $field_name
+ *   The field that changed.
+ * @param string $langcode
+ *   The language of the values that changed.
+ * @param int $changed
+ *   Unix timestamp of the change.
+ * @param int $uid
+ *   The person who made the change, or 0 if unknown.
+ * @param int|null $revision_id
+ *   The revision saved with the change, if any.
+ */
+function field_change_log_record($entity_type, $bundle, $entity_id, $field_name, $langcode, $changed, $uid = 0, $revision_id = NULL) {
+  $row = [
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'entity_id' => $entity_id,
+    'field_name' => $field_name,
+    'langcode' => $langcode,
+    'revision_id' => $revision_id ?: NULL,
+    'uid' => $uid,
+    'changed' => $changed,
+  ];
+  db_insert('field_change_log')->fields($row)->execute();
+
+  // Keep only the newest change in the "latest" table, even when an older
+  // change is recorded later (for example while rebuilding from revisions).
+  $current = db_query('SELECT changed FROM {field_change_log_latest} WHERE entity_type = :type AND entity_id = :id AND field_name = :field AND langcode = :langcode', [
+    ':type' => $entity_type,
+    ':id' => $entity_id,
+    ':field' => $field_name,
+    ':langcode' => $langcode,
+  ])->fetchField();
+  if ($current === FALSE || $changed >= $current) {
+    db_merge('field_change_log_latest')
+      ->key([
+        'entity_type' => $entity_type,
+        'entity_id' => $entity_id,
+        'field_name' => $field_name,
+        'langcode' => $langcode,
+      ])
+      ->fields($row)
+      ->execute();
+  }
+}
+
+/**
+ * Reduces field items to their stored values, for comparison.
+ *
+ * Keeps only the field's database columns, drops empty items (as the Field
+ * API does on save) and casts values to strings, so that "5" and 5, extra
+ * display properties, or a re-save of identical values never count as a
+ * change.
+ *
+ * @param array $field
+ *   The field definition.
+ * @param array $values
+ *   Field values keyed by langcode, then delta.
+ *
+ * @return array
+ *   Normalized values keyed by langcode, with empty languages removed.
+ */
+function field_change_log_normalize_values(array $field, array $values) {
+  $columns = array_keys($field['columns']);
+  $normalized = [];
+  foreach ($values as $langcode => $items) {
+    if (!is_array($items)) {
+      continue;
+    }
+    $clean = [];
+    foreach ($items as $item) {
+      if (!is_array($item) || module_invoke($field['module'], 'field_is_empty', $item, $field)) {
+        continue;
+      }
+      $row = [];
+      foreach ($columns as $column) {
+        $row[$column] = isset($item[$column]) && !is_array($item[$column]) ? (string) $item[$column] : '';
+      }
+      $clean[] = $row;
+    }
+    if ($clean) {
+      $normalized[$langcode] = $clean;
+    }
+  }
+  return $normalized;
+}
+
+/* --------------------------------------------------------------------------
+ * Reading.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Returns the most recent change to a field of an entity.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param int $entity_id
+ *   The entity ID.
+ * @param string $field_name
+ *   The field.
+ * @param string|null $langcode
+ *   Prefer changes in this language. Falls back to language-neutral values,
+ *   then to the newest change in any language.
+ *
+ * @return object|false
+ *   A row from {field_change_log_latest} (changed, uid, revision_id, ...), or
+ *   FALSE if no change has been recorded.
+ */
+function field_change_log_get_latest($entity_type, $entity_id, $field_name, $langcode = NULL) {
+  $rows = db_query('SELECT * FROM {field_change_log_latest} WHERE entity_type = :type AND entity_id = :id AND field_name = :field ORDER BY changed DESC', [
+    ':type' => $entity_type,
+    ':id' => $entity_id,
+    ':field' => $field_name,
+  ])->fetchAllAssoc('langcode');
+  if (!$rows) {
+    return FALSE;
+  }
+  foreach ([$langcode, LANGUAGE_NONE] as $preferred) {
+    if ($preferred !== NULL && isset($rows[$preferred])) {
+      return $rows[$preferred];
+    }
+  }
+  return reset($rows);
+}
+
+/**
+ * Returns options for choosing a date format.
+ */
+function field_change_log_date_format_options() {
+  $options = [];
+  foreach (system_get_date_formats() as $name => $format) {
+    $options[$name] = t('@label (@example)', [
+      '@label' => $format['label'],
+      '@example' => format_date(REQUEST_TIME, $name),
+    ]);
+  }
+  return $options;
+}
+
+/**
+ * Returns HTML for a "last changed" line.
+ *
+ * @param array $variables
+ *   - changed: Unix timestamp.
+ *   - uid: The person who made the change, or 0.
+ *   - text_before: Text shown before the date, e.g. "Last updated:".
+ *   - date_format: A date format machine name.
+ *   - show_author: Whether to add "by NAME".
+ *
+ * @ingroup themeable
+ */
+function theme_field_change_log_last_changed(array $variables) {
+  $date = format_date($variables['changed'], $variables['date_format']);
+  $output = '<time datetime="' . format_date($variables['changed'], 'custom', 'c') . '">' . $date . '</time>';
+  if ($variables['show_author'] && $variables['uid'] && ($account = user_load($variables['uid']))) {
+    $output = t('!date by !name', ['!date' => $output, '!name' => theme('username', ['account' => $account])]);
+  }
+  if ($variables['text_before'] !== '') {
+    $output = '<span class="field-change-log-label">' . check_plain($variables['text_before']) . '</span> ' . $output;
+  }
+  return '<div class="field-change-log">' . $output . '</div>';
+}
+
+/* --------------------------------------------------------------------------
+ * Display: extra fields (Manage Display) and a block (Layouts).
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Implements hook_field_extra_fields().
+ *
+ * Each tracked field gets a "last changed" item under Manage Display, hidden
+ * until a site architect drags it into place.
+ */
+function field_change_log_field_extra_fields() {
+  $extra = [];
+  foreach (field_change_log_tracked_fields() as $entity_type => $bundles) {
+    foreach ($bundles as $bundle => $field_names) {
+      foreach ($field_names as $field_name) {
+        $instance = field_info_instance($entity_type, $field_name, $bundle);
+        if (!$instance) {
+          continue;
+        }
+        $extra[$entity_type][$bundle]['display']['field_change_log_' . $field_name] = [
+          'label' => t('@field: last changed', ['@field' => $instance['label']]),
+          'description' => t('When @field last changed (Field Change Log).', ['@field' => $instance['label']]),
+          'weight' => 100,
+          'visible' => FALSE,
+        ];
+      }
+    }
+  }
+  return $extra;
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function field_change_log_entity_view($entity, $type, $view_mode, $langcode) {
+  list($id, , $bundle) = entity_extract_ids($type, $entity);
+  $fields = field_change_log_tracked_fields($type, $bundle);
+  if (!$fields || empty($id)) {
+    return;
+  }
+  $config = config('field_change_log.settings');
+  $extra = field_extra_fields_get_display($type, $bundle, $view_mode);
+  foreach ($fields as $field_name) {
+    $key = 'field_change_log_' . $field_name;
+    if (empty($extra[$key]['visible'])) {
+      continue;
+    }
+    if ($latest = field_change_log_get_latest($type, $id, $field_name, $langcode)) {
+      $entity->content[$key] = [
+        '#theme' => 'field_change_log_last_changed',
+        '#changed' => $latest->changed,
+        '#uid' => $latest->uid,
+        '#text_before' => $config->get('prefix'),
+        '#date_format' => $config->get('date_format'),
+        '#weight' => $extra[$key]['weight'],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function field_change_log_block_info() {
+  return [
+    'last_changed' => [
+      'info' => t('Field last changed'),
+      'description' => t('When a tracked field of the current content last changed, e.g. "Last updated: October 5, 2026".'),
+      'required contexts' => ['node' => 'node'],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_block_configure().
+ */
+function field_change_log_block_configure($delta = '', $settings = []) {
+  $form = [];
+  if ($delta != 'last_changed') {
+    return $form;
+  }
+  $settings += [
+    'field_name' => '',
+    'prefix' => config_get('field_change_log.settings', 'prefix'),
+    'date_format' => config_get('field_change_log.settings', 'date_format'),
+    'show_author' => FALSE,
+  ];
+
+  $options = [];
+  foreach (field_change_log_tracked_fields('node') as $bundle => $field_names) {
+    foreach ($field_names as $field_name) {
+      $instance = field_info_instance('node', $field_name, $bundle);
+      if ($instance && !isset($options[$field_name])) {
+        $options[$field_name] = t('@label (@field)', ['@label' => $instance['label'], '@field' => $field_name]);
+      }
+    }
+  }
+
+  $form['field_name'] = [
+    '#type' => 'select',
+    '#title' => t('Field'),
+    '#options' => $options,
+    '#default_value' => $settings['field_name'],
+    '#required' => TRUE,
+    '#empty_option' => $options ? t('- Choose a field -') : t('- No tracked fields yet -'),
+    '#description' => t('Only tracked fields are listed. Turn on "Track when this field changes" in a field\'s settings to add it.'),
+  ];
+  $form['prefix'] = [
+    '#type' => 'textfield',
+    '#title' => t('Text before the date'),
+    '#default_value' => $settings['prefix'],
+  ];
+  $form['date_format'] = [
+    '#type' => 'select',
+    '#title' => t('Date format'),
+    '#options' => field_change_log_date_format_options(),
+    '#default_value' => $settings['date_format'],
+  ];
+  $form['show_author'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Show who made the change'),
+    '#default_value' => $settings['show_author'],
+  ];
+  return $form;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function field_change_log_block_view($delta = '', $settings = [], $contexts = []) {
+  if ($delta != 'last_changed' || empty($contexts['node']) || empty($settings['field_name'])) {
+    return [];
+  }
+  $node = $contexts['node'];
+  if (empty($node->nid) || !field_change_log_is_tracked('node', $node->type, $settings['field_name'])) {
+    return [];
+  }
+  $latest = field_change_log_get_latest('node', $node->nid, $settings['field_name'], $node->langcode ?? NULL);
+  if (!$latest) {
+    return [];
+  }
+  return [
+    'subject' => NULL,
+    'content' => [
+      '#theme' => 'field_change_log_last_changed',
+      '#changed' => $latest->changed,
+      '#uid' => $latest->uid,
+      '#text_before' => $settings['prefix'] ?? '',
+      '#date_format' => $settings['date_format'] ?? 'medium',
+      '#show_author' => !empty($settings['show_author']),
+    ],
+  ];
+}
